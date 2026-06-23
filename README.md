@@ -258,3 +258,172 @@ Temperature acts as a direct mathematical scaling multiplier applied directly in
 | **Sequence-to-Sequence** (Encoder-Decoder) | **Span Corruption:** Replaces entire variable-length token strings with dedicated custom **Sentinel Tokens** for the decoder to unpack. | **Mixed** (Bidirectional input reading -> Unidirectional generation) | Translating languages, structural text summarization, answering hard context questions. | T5, BART |
 
 ---
+
+
+# Lab 1 — Dialogue Summarization with Flan-T5
+### DeepLearning.AI + AWS Generative AI with LLMs
+
+> Zero-shot, one-shot, and few-shot prompt engineering using `google/flan-t5-base` on the DialogSum dataset.  
+> Run locally on Ubuntu — CPU only, 8GB RAM. No cloud. No GPU. No excuses.
+
+---
+
+## What This Lab Does
+
+Uses **in-context learning** (no fine-tuning) to make Flan-T5 summarize customer support conversations.  
+Three approaches tested:
+
+| Approach | Examples Given | Result |
+|---|---|---|
+| Zero-shot (no prompt) | 0 | Model answered the question instead of summarizing |
+| Zero-shot (with instruction) | 0 | Slightly better — at least it tried to summarize |
+| One-shot | 1 complete example | Noticeably better — model understood the format |
+| Few-shot (3 examples) | 3 complete examples | Hit 818/512 token limit → hallucinated a pendant 😭 |
+| Few-shot (2 examples) | 2 complete examples | 630/512 tokens — still truncated but coherent output |
+
+---
+
+## Dataset
+
+**DialogSum** — 13,000+ real-world support dialogues with human-written summaries.  
+Loaded via HuggingFace Datasets:
+
+```python
+from datasets import load_dataset
+dataset = load_dataset("knkarthick/dialogsum")
+```
+
+Auto-downloads and caches to `~/.cache/huggingface/datasets/`.
+
+---
+
+## Model
+
+**google/flan-t5-base** — a seq2seq model by Google, fine-tuned on 1,800+ tasks.  
+~250MB. Context window: **512 tokens** (this matters a lot — see Bugs section).
+
+```python
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+model = AutoModelForSeq2SeqLM.from_pretrained('google/flan-t5-base')
+tokenizer = AutoTokenizer.from_pretrained('google/flan-t5-base')
+```
+
+---
+
+## Local Setup (Ubuntu, CPU-only)
+
+```bash
+# 1. Create project folder and virtual environment
+mkdir ~/lab1_dialogsum && cd ~/lab1_dialogsum
+python3 -m venv venv
+source venv/bin/activate
+
+# 2. Install dependencies (pinned for compatibility)
+pip install --upgrade pip
+pip install \
+  torch==2.5.1 \
+  datasets==2.17.0 \
+  transformers==4.38.2 \
+  "pandas==1.5.3" \
+  "numpy<2.0.0" \
+  sentencepiece \
+  accelerate \
+  jupyter
+
+# 3. Launch notebook
+jupyter notebook
+```
+
+> ⚠️ **pandas must be pinned to 1.5.3** — pandas 2.0+ removed the `verbose` argument  
+> from `read_csv()` which `datasets==2.17.0` still passes. Anything above 1.5.3 will crash on dataset load.
+
+---
+
+## Bugs I Hit (and Fixed)
+
+### Bug 1 — pandas version conflict
+```
+TypeError: read_csv() got an unexpected keyword argument 'verbose'
+```
+**Cause:** pandas 3.0.3 (latest) dropped `verbose=` from `read_csv()`. `datasets==2.17.0` still passes it.  
+**Fix:** `pip install "pandas==1.5.3"`
+
+---
+
+### Bug 2 — Silent indentation error in for-loop
+```python
+# BROKEN — only prints the last example
+for i, index in enumerate(example_indices):
+    dialogue = dataset['test'][index]['dialogue']
+    inputs = tokenizer(dialogue, return_tensors='pt')
+    output = tokenizer.decode(model.generate(inputs["input_ids"])[0])
+
+print(f'OUTPUT: {output}')  # ← outside the loop! only runs once
+```
+```python
+# FIXED — indent everything inside the loop
+for i, index in enumerate(example_indices):
+    dialogue = dataset['test'][index]['dialogue']
+    inputs = tokenizer(dialogue, return_tensors='pt')
+    output = tokenizer.decode(model.generate(inputs["input_ids"])[0])
+    print(f'OUTPUT: {output}')  # ← inside the loop ✅
+```
+No error thrown. Python just silently runs it wrong. Classic.
+
+---
+
+### Bug 3 — The Pendant Incident 🪙
+Few-shot prompt with 3 examples = **818 tokens**.  
+Flan-T5-base max = **512 tokens**.  
+Tokenizer truncated the input. The actual dialogue to summarize got **cut off entirely**.  
+Model hallucinated: *"Person1 is looking for a new pendant"* — about a PC upgrade conversation.
+
+**Fix — always check token count before generating:**
+```python
+token_count = len(tokenizer(prompt)['input_ids'])
+print(f'Prompt token count: {token_count} / 512')
+
+# Safe tokenizer call with explicit truncation
+inputs = tokenizer(prompt, return_tensors='pt', truncation=True, max_length=512)
+```
+
+---
+
+## Key Concepts Learned
+
+**Tokenization** — text → integer IDs → embedding vectors. The model never sees words, only numbers.  
+`return_tensors='pt'` means "give me a PyTorch tensor". `decode()` reverses it back to text.
+
+**Zero/One/Few-shot inference** — giving the model 0, 1, or N complete examples before your actual question. More examples = better format understanding, but you eat into your context window fast.
+
+**Context window** — the maximum number of tokens a model can process at once. Flan-T5-base: 512. Overflow it and your input gets silently truncated.
+
+**GenerationConfig** — bundle generation settings into an object:
+```python
+from transformers import GenerationConfig
+
+# Conservative (same answer every time)
+config = GenerationConfig(max_new_tokens=50, do_sample=True, temperature=0.1)
+
+# Creative (different answer every time, may be wild)
+config = GenerationConfig(max_new_tokens=50, do_sample=True, temperature=1.0)
+
+output = model.generate(inputs["input_ids"], generation_config=config)
+```
+
+**`do_sample=False` (greedy)** → always picks the most probable next token → deterministic but repetitive.  
+**`do_sample=True` + temperature** → samples from a probability distribution → varied, sometimes creative, sometimes chaotic.
+
+---
+
+## Hardware Note
+
+All of this ran on an **HP EliteBook 840 G5** — 8GB RAM, CPU-only, Ubuntu.  
+Each `model.generate()` call: ~30 seconds.  
+Flan-T5-base is the largest model that's safe on this setup. Don't try `flan-t5-large` or above.
+
+---
+
+## Course
+[DeepLearning.AI — Generative AI with LLMs](https://www.deeplearning.ai/courses/generative-ai-with-llms/) (with AWS)  
+**Status:** Lab 1 ✅ → Lab 2 in progress
